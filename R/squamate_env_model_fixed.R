@@ -10,7 +10,7 @@ conflict_prefer("filter", "dplyr")
 
 set.seed(536567678)
 
-squamate_train <- read_csv("output/squamate_training.csv")
+squamate_train <- read_csv("output/squamate_training2.csv")
 
 species <- as.integer(as.numeric(as.factor(squamate_train$Binomial)))
 
@@ -24,7 +24,7 @@ squamate_train <- scale(squamate_train)
 scaling <- list(means = attr(squamate_train, "scaled:center"),
                 sd = attr(squamate_train, "scaled:scale"))
 
-write_rds(scaling, "output/squamate_env_scaling.rds")
+write_rds(scaling, "output/squamate_env_scaling2.rds")
 
 na_mask <- apply(squamate_train, 2, function(x) as.numeric(!is.na(x)))
 
@@ -94,15 +94,15 @@ env_vae_mod <- nn_module("ENV_VAE",
                          loss_function = function(reconstruction, input, mask, mean, log_var, mean_spec, #log_var_spec, 
                                                   #loggamma,
                                                   lambda = 1,
-                                                  alpha = 1) {
+                                                  alpha = 0) {
                            
                            kl <- torch_sum(torch_exp(log_var) + torch_square(mean) - log_var, dim = 2L) - self$latent_dim
                            kl_spec <- ((1 - alpha) * torch_sum(torch_square(mean_spec), dim = 2L) + alpha * torch_sum(torch_abs(mean_spec), dim = 2L)) * lambda
-                           recon1 <- torch_sum(torch_square(input - (reconstruction * mask)), dim = 2L) / torch_exp(self$loggamma)
+                           recon1 <- torch_sum(torch_square(input - reconstruction) * mask, dim = 2L) / torch_exp(self$loggamma)
                            recon2 <- self$input_dim * self$loggamma + torch_log(torch_tensor(2 * pi, device = "cuda")) * self$input_dim
-                           recon_loss <- (torch_sum(recon1) / torch_sum(mask)) + torch_mean(recon2)
-                           loss <- torch_mean(kl + kl_spec) + recon_loss
-                           list(loss, torch_mean(recon1*torch_exp(self$loggamma)), torch_mean(kl), torch_mean(kl_spec))
+                           #recon_loss <- (torch_sum(recon1) / torch_sum(mask)) + torch_mean(recon2)
+                           loss <- torch_mean(kl + kl_spec + recon1 + recon2)
+                           list(loss, torch_mean(recon1*torch_exp(self$loggamma)) / self$input_dim, torch_mean(kl), torch_mean(kl_spec))
                          },
                          encode = function(x, s = NULL) {
                            if(is.null(s)) {
@@ -155,11 +155,12 @@ n_spec <- n_distinct(species)
 spec_embed_dim <- 32L
 latent_dim <- 16L
 breadth <- 1024L
+alpha <- 0.5
 
 env_vae <- env_vae_mod(input_dim, n_spec, spec_embed_dim, latent_dim, breadth, loggamma_init = -3)
 env_vae <- env_vae$cuda()
 
-num_epochs <- 3000
+num_epochs <- 2500
 
 lr <- 0.002
 optimizer <- optim_adamw(env_vae$parameters, lr = lr)
@@ -170,6 +171,10 @@ scheduler <- lr_one_cycle(optimizer, max_lr = lr,
 epoch_times <- numeric(num_epochs * length(train_dl))
 i <- 0
 #b <- train_dl$.iter()$.next()
+
+zz <- file("output/logs/squamate_env_model_fixed2_run_1.txt", open = "wt")
+sink(zz, type = "output", split = TRUE)
+sink(zz, type = "message")
 
 for (epoch in 1:num_epochs) {
   
@@ -182,7 +187,10 @@ for (epoch in 1:num_epochs) {
     optimizer$zero_grad()
     
     c(reconstruction, input, mean_spec, means, log_vars) %<-% env_vae(b$env$cuda(), b$spec$cuda())
-    c(loss, reconstruction_loss, kl_loss, kl_loss_spec) %<-% env_vae$loss_function(reconstruction, input, b$mask$cuda(), means, log_vars, mean_spec, alpha = 0.9)
+    c(loss, reconstruction_loss, kl_loss, kl_loss_spec) %<-% env_vae$loss_function(reconstruction, input, 
+                                                                                   b$mask$cuda(), means, 
+                                                                                   log_vars, mean_spec, 
+                                                                                   alpha = alpha)
     
       cat("Epoch: ", epoch,
           "  batch: ", batchnum,
@@ -209,5 +217,7 @@ for (epoch in 1:num_epochs) {
 }
 
 options(torch.serialization_version = 2)
-torch_save(env_vae, "data/env_vae_1_trained_fixed_32d.to")
+torch_save(env_vae, "data/env_vae_trained_fixed2_alpha_0.5_32d.to")
+
+sink()
 

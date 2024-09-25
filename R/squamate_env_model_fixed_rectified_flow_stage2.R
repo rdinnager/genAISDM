@@ -2,9 +2,10 @@ library(tidyverse)
 library(torch)
 library(deSolve)
 library(dagnn)
+library(unglue)
 options(torch.serialization_version = 2)
 
-codes_df <- read_rds("output/squamate_env_latent_codes_for_stage2.rds") |>
+codes_df <- read_rds("output/squamate_env_latent_codes_for_stage2_2.rds") |>
   slice_sample(prop = 1)
 
 batch_size <- 5e5
@@ -21,7 +22,7 @@ make_batch <- function(codes_df, batch_num = 1) {
     filter(batch == batch_num)
   
   v <- coord_dat |>
-    select(V1, V2, V3) |>
+    select(starts_with("V")) |>
     as.matrix() |>
     torch_tensor(pin_memory = TRUE)
   
@@ -45,12 +46,12 @@ generate_training_data <- function(v,
   with_no_grad({
   
     n <- v$size()[1]
+    d <- v$size()[2]
     
     t <- torch_rand(n, 1, device = device)
     
-    z <- torch_tensor(cbind(sample_fun(n, ...),
-                            sample_fun(n, ...),
-                            sample_fun(n, ...)),
+    funs <- cbind(replicate(d, sample_fun(n, ...)))
+    z <- torch_tensor(funs,
                       device = device)
     
     target <- v$to(device = device) - z
@@ -136,9 +137,30 @@ traj_net <- nn_module("TrajNet",
                         
                       })
 
-coord_dim <- 3
+coord_dim <- 6
 spec_dim <- codes_df |> select(starts_with("L")) |> slice_head(n = 1) |> ncol()
-trajnet <- traj_net(coord_dim, spec_dim)
+
+checkpoint_fold <- "output/checkpoints/squamate_env_model_fixed_rectified_flow_stage2_7d"
+if(!dir.exists(checkpoint_fold)) {
+  dir.create(checkpoint_fold)
+  trajnet <- traj_net(coord_dim, spec_dim)
+  i <- 0
+  start_epoch <- 0
+  epoch <- 0
+  batch_num <- 0
+} else {
+  checkpoint_files <- list.files(checkpoint_fold, full.names = TRUE, pattern = ".pt")
+  checkpoints <- file.info(checkpoint_files)
+  most_recent <- which.max(checkpoints$mtime)
+  checkpoint <- checkpoint_files[most_recent]
+  trajnet <- torch_load(checkpoint)
+  progress <- unglue_data(basename(checkpoint_files),
+                                   "epoch_{epoch}_batch_{batch_num}_model.pt")[most_recent, ]
+  i <- 0
+  start_epoch <- as.numeric(progress$epoch)
+  epoch <- start_epoch
+  batch_num <- 0
+}
 trajnet <- trajnet$cuda()
 trajnet
 
@@ -188,7 +210,7 @@ scheduler <- lr_one_cycle(optimizer, max_lr = lr,
                           epochs = n_epoch, steps_per_epoch = n_batches,
                           cycle_momentum = FALSE)
 
-plot_result <- function(trajnet, codes_df, n_specs = 4, steps = 250,
+plot_result <- function(trajnet, codes_df, n_specs = 9, steps = 250,
                         sample_fun = rnorm, ...) {
   with_no_grad({
     
@@ -203,16 +225,26 @@ plot_result <- function(trajnet, codes_df, n_specs = 4, steps = 250,
       torch_tensor(pin_memory = TRUE)
     
     n <- dim(spect)[1]
+    d <- coord_dat |>
+      select(starts_with("V")) |>
+      ncol()
     
-    y_init <- torch_tensor(cbind(sample_fun(n), sample_fun(n), sample_fun(n)))
+    funs <- cbind(replicate(d, sample_fun(n)))
+    y_init <- torch_tensor(funs)
     res <- trajnet$sample_trajectory(y_init$cuda(), spect$cuda(), steps = steps)
     final <- res$trajectories[steps, , ]
     colnames(final) <- paste0("T", 1:ncol(final))
     coord_dat <- coord_dat |>
       bind_cols(as.data.frame(final))
-    old <- par(mfrow = c(2, 2))
-    walk(specsamp, ~ {plot(coord_dat |> filter(species == .x) |> select(V1, V2), col = "green", pch = 19, cex = 1.3);
-      points(coord_dat |> filter(species == .x) |> select(T1, T2), col = "red", pch = 19, cex = 1)})
+    col_pick <- map(specsamp, ~ sample.int(d, 2))
+    old <- par(mfrow = c(3, 3))
+    walk2(specsamp, col_pick, ~ {
+        all  <- rbind(coord_dat |> filter(species == .x) |> select(all_of(paste0("T", .y))) |> as.matrix(),
+                      coord_dat |> filter(species == .x) |> select(all_of(paste0("V", .y))) |> as.matrix());
+        plot(all, col = "black", cex = 1.4);
+        points(coord_dat |> filter(species == .x) |> select(all_of(paste0("V", .y))), col = alpha("darkgreen", 0.5), pch = 19, cex = 1.3);
+        points(coord_dat |> filter(species == .x) |> select(all_of(paste0("T", .y))), col = alpha("red", 0.5), pch = 19, cex = 1.3)
+      })
     par(old)
     y_init$detach()
   })
@@ -221,21 +253,19 @@ plot_result <- function(trajnet, codes_df, n_specs = 4, steps = 250,
 
 
 losses <- numeric(n_epoch * n_batches)
-i <- 0
-epoch <- 0
-batch_num <- 0
 total_iter <- n_epoch * n_batches
 epoch_times <- numeric(total_iter)
 
-checkpoint_fold <- "output/checkpoints/squamate_env_model_fixed_rectified_flow_stage2_2"
 cat("Plotting current result: \n")
 ragg::agg_png(file.path(checkpoint_fold, glue::glue("epoch_{epoch}_batch_{batch_num}_plot.png")),
-              width = 1000, height = 1000)
+              width = 1256, height = 1256)
 try(plot_result(trajnet, codes_df))
 dev.off()
 torch_save(trajnet, file.path(checkpoint_fold, glue::glue("epoch_{epoch}_batch_{batch_num}_model.pt")))
 
-for(epoch in seq_len(n_epoch)) {
+final_epoch <- start_epoch + n_epoch
+
+for(epoch in start_epoch + seq_len(n_epoch)) {
   
   epoch_time <- Sys.time()
   
@@ -270,7 +300,7 @@ for(epoch in seq_len(n_epoch)) {
     if(i %% 1000 == 0) {
       cat("Plotting current result: \n")
       ragg::agg_png(file.path(checkpoint_fold, glue::glue("epoch_{epoch}_batch_{batch_num}_plot.png")),
-                    width = 1000, height = 500)
+                    width = 1256, height = 1256)
       try(plot_result(trajnet, codes_df, steps = 250))
       dev.off()
     }
@@ -286,12 +316,12 @@ for(epoch in seq_len(n_epoch)) {
   time <- Sys.time() - epoch_time
   epoch_times[i] <- time
   cat("Estimated time remaining: ")
-  print(lubridate::as.duration(mean(epoch_times[epoch_times > 0]) * (n_epoch - epoch)))
+  print(lubridate::as.duration(mean(epoch_times[epoch_times > 0]) * (final_epoch - epoch)))
 }
 
 cat("Plotting current result: \n")
 ragg::agg_png(file.path(checkpoint_fold, glue::glue("epoch_{epoch}_batch_{batch_num}_plot.png")),
-              width = 1000, height = 500)
+              width = 1256, height = 1256)
 try(plot_result(trajnet, codes_df))
 dev.off()
 torch_save(trajnet, file.path(checkpoint_fold, glue::glue("epoch_{epoch}_batch_{batch_num}_model.pt")))

@@ -2,7 +2,8 @@ library(tidyverse)
 library(torch)
 library(deSolve)
 library(dagnn)
-options(torch.serialization_version = 2)
+library(unglue)
+options(torch.serialization_version = 3)
 
 chelsa_df <- read_rds("output/geo_env_chelsa.rds")
 
@@ -22,7 +23,7 @@ chelsa_df <- chelsa_df |>
   mutate(across(everything(), ~ replace_na(.x, 0)))
 
 batch_size <- 1.5e6
-n_epoch <- 3e3
+n_epoch <- 5e3
 
 nbatches <- floor(nrow(chelsa_df) / batch_size) + 1
 b <- gl(nbatches, batch_size, nrow(chelsa_df))
@@ -163,17 +164,56 @@ traj_net <- nn_module("TrajNet",
 
 coord_dim <- 2
 env_dim <- chelsa_df |> select(-x, -y, -batch) |> slice_head(n = 1) |> ncol()
-trajnet <- traj_net(2, env_dim)
+
+checkpoint_fold <- "output/checkpoints/geo_env_model_4"
+if(!dir.exists(checkpoint_fold)) {
+  dir.create(checkpoint_fold)
+  trajnet <- traj_net(coord_dim, env_dim)
+  trajnet_jit <- traj_net(coord_dim, env_dim)
+  i <- 0
+  start_epoch <- 0
+  epoch <- 0
+  batch_num <- 0
+} else {
+  checkpoint_files <- list.files(checkpoint_fold, full.names = TRUE, pattern = ".pt")
+  checkpoints <- file.info(checkpoint_files)
+  most_recent <- which.max(checkpoints$mtime)
+  checkpoint <- checkpoint_files[most_recent]
+  trajnet <- torch_load(checkpoint)
+  trajnet_jit <- torch_load(checkpoint)
+  progress <- unglue_data(basename(checkpoint_files),
+                          "epoch_{epoch}_batch_{batch_num}_model.pt")[most_recent, ]
+  i <- 0
+  start_epoch <- as.numeric(progress$epoch)
+  epoch <- start_epoch
+  batch_num <- 0
+}
 trajnet <- trajnet$cuda()
+trajnet_jit <- trajnet_jit$cuda()
 trajnet
 
-## test trajectory
-y_init <- torch_randn(1000, coord_dim)
-env <- torch_randn(1000, env_dim)
-traj_test <- trajnet$sample_trajectory(y_init$cuda(), env$cuda())
-traj_test
+test <- generate_training_data(batches[[1]]$xy,
+                               batches[[1]]$env,
+                               device = "cuda",
+                               x_sample_fun = x_samp, 
+                               y_sample_fun = y_samp)
 
-plot(traj_test$trajectories[ , 100, ], type = "l")
+trajnet_jit$encode_env <- jit_trace(trajnet_jit$encode_env, test$env)
+trajnet_jit$encode_t <- jit_trace(trajnet_jit$encode_t, test$t)
+trajnet_jit$unet <- jit_trace(trajnet_jit$unet, test$coords, trajnet_jit$encode_t(test$t), 
+                              trajnet_jit$encode_env(test$env))
+
+#trajnet$load_state_dict(trajnet_jit$state_dict())
+#torch_save(trajnet, "test.pt")
+#test_test <- torch_load("test.pt")
+
+## test trajectory
+# y_init <- torch_randn(1000, coord_dim)
+# env <- torch_randn(1000, env_dim)
+# traj_test <- trajnet$sample_trajectory(y_init$cuda(), env$cuda())
+# traj_test
+
+#plot(traj_test$trajectories[ , 100, ], type = "l")
 
 # sample_batch <- function(train_dat, batch_num = 1) {
 #   coord_dat <- train_dat |>
@@ -208,7 +248,7 @@ plot(traj_test$trajectories[ , 100, ], type = "l")
 # batches <- unique(train_dat$batch)
 n_batches <- length(batches)
 lr <- 1e-3
-optimizer <- optim_adamw(trajnet$parameters, lr = lr, weight_decay = 0.01)
+optimizer <- optim_adamw(trajnet_jit$parameters, lr = lr, weight_decay = 0.01)
 scheduler <- lr_one_cycle(optimizer, max_lr = lr,
                           epochs = n_epoch, steps_per_epoch = n_batches,
                           cycle_momentum = FALSE)
@@ -234,19 +274,22 @@ plot_result <- function(trajnet, env_batch, n_samps = 5000, steps = 500,
 
 losses <- numeric(n_epoch * n_batches)
 i <- 0
-epoch <- 0
+#epoch <- 0
 batch_num <- 0
 total_iter <- n_epoch * n_batches
 epoch_times <- numeric(total_iter)
 
 cat("Plotting current result: \n")
-ragg::agg_png(file.path("output/checkpoints/geo_env_model_1", glue::glue("epoch_{epoch}_batch_{batch_num}_plot.png")),
+ragg::agg_png(file.path(checkpoint_fold, glue::glue("epoch_{epoch}_batch_{batch_num}_plot.png")),
               width = 1000, height = 500)
-try(plot_result(trajnet, batches[[1]]$env, x_sample_fun = x_samp, y_sample_fun = y_samp))
+try(plot_result(trajnet_jit, batches[[1]]$env, x_sample_fun = x_samp, y_sample_fun = y_samp))
 dev.off()
-torch_save(trajnet, file.path("output/checkpoints/geo_env_model_1", glue::glue("epoch_{epoch}_batch_{batch_num}_model.pt")))
+trajnet$load_state_dict(trajnet_jit$state_dict())
+torch_save(trajnet, file.path(checkpoint_fold, glue::glue("epoch_{epoch}_batch_{batch_num}_model.pt")))
 
-for(epoch in seq_len(n_epoch)) {
+final_epoch <- start_epoch + n_epoch
+
+for(epoch in start_epoch + seq_len(n_epoch)) {
   
   epoch_time <- Sys.time()
   
@@ -257,17 +300,19 @@ for(epoch in seq_len(n_epoch)) {
     
     optimizer$zero_grad()
     
+    browser()
+    
     batch <- generate_training_data(batches[[batch_num]]$xy,
                                     batches[[batch_num]]$env,
                                     device = "cuda",
                                     x_sample_fun = x_samp, 
                                     y_sample_fun = y_samp)
     
-    output <- trajnet(batch$coords,
+    output <- trajnet_jit(batch$coords,
                       batch$t,
                       batch$env)
     
-    loss <- trajnet$loss_function(output, batch$target)
+    loss <- trajnet_jit$loss_function(output, batch$target)
     losses[i] <- as.numeric(loss$cpu())
     
     if(batch_num %% 10 == 0) {
@@ -280,13 +325,14 @@ for(epoch in seq_len(n_epoch)) {
       
     }
     
-    if(i %% 200 == 0) {
+    if(i %% 1000 == 0) {
       cat("Plotting current result: \n")
-      ragg::agg_png(file.path("output/checkpoints/geo_env_model_1", glue::glue("epoch_{epoch}_batch_{batch_num}_plot.png")),
+      ragg::agg_png(file.path(checkpoint_fold, glue::glue("epoch_{epoch}_batch_{batch_num}_plot.png")),
                     width = 1000, height = 500)
-      try(plot_result(trajnet, batch$env$detach(), x_sample_fun = x_samp, y_sample_fun = y_samp))
+      try(plot_result(trajnet_jit, batch$env$detach(), x_sample_fun = x_samp, y_sample_fun = y_samp))
       dev.off()
-      torch_save(trajnet, file.path("output/checkpoints/geo_env_model_1", glue::glue("epoch_{epoch}_batch_{batch_num}_model.pt")))
+      trajnet$load_state_dict(trajnet_jit$state_dict())
+      torch_save(trajnet, file.path(checkpoint_fold, glue::glue("epoch_{epoch}_batch_{batch_num}_model.pt")))
     }
     
     loss$backward()
@@ -297,12 +343,13 @@ for(epoch in seq_len(n_epoch)) {
   time <- Sys.time() - epoch_time
   epoch_times[i] <- time
   cat("Estimated time remaining: ")
-  print(lubridate::as.duration(mean(epoch_times[epoch_times > 0]) * (n_epoch - epoch)))
+  print(lubridate::as.duration(mean(epoch_times[epoch_times > 0]) * (final_epoch - epoch)))
 }
 
 cat("Plotting current result: \n")
-ragg::agg_png(file.path("output/checkpoints/geo_env_model_1", glue::glue("epoch_{epoch}_batch_{batch_num}_plot.png")),
+ragg::agg_png(file.path(checkpoint_fold, glue::glue("epoch_{epoch}_batch_{batch_num}_plot.png")),
               width = 1000, height = 500)
-try(plot_result(trajnet, batch$env, x_sample_fun = x_samp, y_sample_fun = y_samp))
+try(plot_result(trajnet_jit, batch$env, x_sample_fun = x_samp, y_sample_fun = y_samp))
 dev.off()
-torch_save(trajnet, file.path("output/checkpoints/geo_env_model_1", glue::glue("epoch_{epoch}_batch_{batch_num}_model.pt")))
+trajnet$load_state_dict(trajnet_jit$state_dict())
+torch_save(trajnet, file.path(checkpoint_fold, glue::glue("epoch_{epoch}_batch_{batch_num}_model.pt")))

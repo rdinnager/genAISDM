@@ -3,7 +3,7 @@ library(sf)
 library(terra)
 library(furrr)
 
-sample_files <- list.files("output/squamate_samples", full.names = TRUE)
+sample_files <- list.files("output/squamate_samples2", full.names = TRUE)
 
 samples <- map(sample_files, read_rds, .progress = TRUE)
 nums <- gsub(".rds", "", basename(sample_files)) |>
@@ -32,7 +32,7 @@ extract_env <- function(pts, chelsa_files) {
 future::plan(future::multisession(workers = 10))
 env_dat <- future_map(samples, ~ extract_env(.x, chelsa_files = chelsa_files), .progress = TRUE)
 
-write_rds(env_dat, "output/squamate_all_env_dat_w_coords.rds")
+write_rds(env_dat, "output/squamate_all_env_dat_w_coords2.rds")
 
 #env_dat <- read_rds("output/squamate_all_env_dat.rds")
 
@@ -48,7 +48,7 @@ squamates2 <- squamates2 |>
 squamates2 <- squamates2 |>
   filter(nonempty)
 
-write_rds(squamates2, "output/squamate_final_data_w_env_samps.rds")
+write_rds(squamates2, "output/squamate_final_data_w_env_samps2.rds")
 
 
 
