@@ -15,15 +15,18 @@ library(eks)
 world <- ne_countries(scale = 10)
 maps <- read_rds("data/final_squamate_sf.rds")
 ecoregions <- read_rds("data/maps/ecoregions_valid.rds")
-data(countries110)
-countries110 <- st_make_valid(countries110)
+
+# data(countries110)
+# countries110 <- st_make_valid(countries110)
 
 options(torch.serialization_version = 2)
-checkpoint_dir <- "output/checkpoints/squamate_env_model_fixed_rectified_flow_stage2_7d"
-files <- list.files(checkpoint_dir, full.names = TRUE, pattern = ".pt")
-file_info <- file.info(files)
-latest <- which.max(file_info$mtime)
-mod_file <- files[latest]
+checkpoint_fold <- "output/checkpoints/squamate_env_model_fixed_rectified_flow_stage2_distill_7d"
+checkpoint_files <- list.files(checkpoint_fold, full.names = TRUE, pattern = ".pt")
+checkpoints <- file.info(checkpoint_files)
+most_recent <- which.max(checkpoints$mtime)
+checkpoint <- checkpoint_files[most_recent]
+flow_2 <- torch_load(checkpoint)
+flow_2 <- flow_2$cuda()
 
 checkpoint_dir_geo <- "output/checkpoints/geo_env_model_3"
 files_geo <- list.files(checkpoint_dir_geo, full.names = TRUE, pattern = ".pt")
@@ -33,8 +36,8 @@ mod_file_geo <- files_geo[latest_geo]
 
 env_vae <- torch_load("data/env_vae_trained_fixed2_alpha_0.5_32d.to")
 env_vae <- env_vae$cuda()
-flow_1 <- torch_load(mod_file)
-flow_1 <- flow_1$cuda()
+# flow_1 <- torch_load(mod_file)
+# flow_1 <- flow_1$cuda()
 
 options(torch.serialization_version = 3)
 geode <- torch_load(mod_file_geo)
@@ -49,6 +52,8 @@ species_df <- tibble(id = as.integer(as.numeric(as.factor(squamate_train$Binomia
                      species = squamate_train$Binomial) |>
   distinct()
 
+write_csv(species_df, "output/training_species.csv")
+
 scaling <- read_rds("output/squamate_env_scaling2.rds")
 geo_scaling <- read_rds("output/chelsa_geo_scaling.rds")
 
@@ -56,24 +61,24 @@ latent_df <- as.data.frame(spec_latents[species_df$id, ])
 colnames(latent_df) <- paste0("L", 1:ncol(latent_df))
 species_latent_df <- bind_cols(species_df, latent_df)
 
-median_lats <- squamate_train |>
-  group_by(Binomial) |>
-  summarise(mid_lat = median(Y))
-
-write_csv(median_lats, "output/squamate_latitudes2.csv")
+# median_lats <- squamate_train |>
+#   group_by(Binomial) |>
+#   summarise(mid_lat = median(Y))
+# 
+# write_csv(median_lats, "output/squamate_latitudes2.csv")
 
 #tree <- read.tree("data/phylogenies/squamates/squamates.tre")
 
-predict_niche <- function(env_vae, flow_1, n = 10000, latent, scaling, active_dims, device = "cuda") {
+predict_niche <- function(env_vae, flow_2, n = 10000, latent, scaling, active_dims, device = "cuda") {
   with_no_grad({
     if(is.null(dim(latent)) || dim(latent)[1] == 1) {
       latent <- matrix(as.vector(latent), nrow = n, ncol = length(latent), byrow = TRUE)
     }
     latent_tens <- torch_tensor(latent, device = device)
     samp1 <- torch_randn(n, length(active_dims), device = device)
-    samp2 <- flow_1$sample_trajectory(initial_vals = samp1, spec_vals = latent_tens, steps = 250)
+    samp2 <- flow_2$sample_trajectory(initial_vals = samp1, spec_vals = latent_tens, steps = 2)
     samp <- matrix(0, ncol = env_vae$latent_dim, nrow = n)
-    samp[ , active_dims] <- samp2$trajectories[250, , ]
+    samp[ , active_dims] <- samp2$trajectories[2, , ]
     samp <- torch_tensor(samp, device = device)
     decoded <- env_vae$decoder(z = samp, s = latent_tens)
     reencoded <- env_vae$encoder(y = decoded, s = latent_tens)
@@ -96,14 +101,14 @@ predict_geo <- function(geode, env_pred, geo_scaling, device = "cuda") {
     n <- dim(env_pred)[1]
     env <- torch_tensor(t((t(env_pred) - mu) / s), device = device)
     samp <- torch_randn(n, 2) * 1.1
-    trajs <- geode$sample_trajectory(initial_vals = samp, env_vals = env, steps = 250)
+    trajs <- geode$sample_trajectory(initial_vals = samp, env_vals = env, steps = 500)
   })
   trajs
 }
 
 spec <- sample(species_df$species, 1)
 generate_range_sample <- function(species, n = 10000, geode, env_vae, 
-                                  flow_1, scaling, geo_scaling,active_dims,
+                                  flow_2, scaling, geo_scaling, active_dims,
                                   species_latent_df, squamate_train) {
   
   latent <- species_latent_df |>
@@ -127,7 +132,7 @@ generate_range_sample <- function(species, n = 10000, geode, env_vae,
   probls <- colnames(prop_nas)[prop_nas > 0.5]
   
   latent_vc <- latent |> select(starts_with("L")) |> unlist()
-  pred_niche_vc <- predict_niche(env_vae, flow_1, latent = latent_vc, 
+  pred_niche_vc <- predict_niche(env_vae, flow_2, latent = latent_vc, 
                                  scaling = scaling, active_dims = active_dims)
   
   if(length(probls) > 0) {
@@ -143,13 +148,13 @@ generate_range_sample <- function(species, n = 10000, geode, env_vae,
   
   mu_xy <- unlist(geo_scaling$mean[1:2])
   s_xy <- unlist(geo_scaling$sd[1:2])
-  coord_pred <- t((t(trajs$trajectories[250, , ]) * (s_xy)) + mu_xy)
+  coord_pred <- t((t(trajs$trajectories[500, , ]) * (s_xy)) + mu_xy)
   
   list(predictions = coord_pred, truth = spec_xy, env_pred = pred_niche_vc, env_truth = spec_train)
 }
 
 coord_predict <- generate_range_sample (spec, n = 10000, geode, env_vae, 
-                                     flow_1, scaling, geo_scaling, active_dims,
+                                     flow_2, scaling, geo_scaling, active_dims,
                                      species_latent_df, squamate_train)
 
 find_equal_area_projection <- function(sf_object) {
@@ -199,7 +204,8 @@ find_equal_area_projection <- function(sf_object) {
 
 #ecoreg_border <- st_union(ecoregions)
 
-localize <- function(coord_predict, spec, ecoregions, world, use_preds = TRUE, res = 5) {
+localize <- function(coord_predict, spec, ecoregions, world, use_preds = FALSE, res = 5) {
+
   pred_sf <- coord_predict$predictions |>
     as.data.frame() |>
     st_as_sf(coords = c("V1", "V2"), crs = 4326)
@@ -214,17 +220,24 @@ localize <- function(coord_predict, spec, ecoregions, world, use_preds = TRUE, r
       mutate(point = 1)
   }
   
-  hexes <- geo_to_h3(pred_sf, res = 4) |>
-    unique()
+  hex_res <- map(1:10, ~ unique(geo_to_h3(truth_sf, .x)), .progress = TRUE)
+  n_hexes <- map_int(hex_res, length)
+  res_choice <- which.min(abs(300 - n_hexes))
+  hexes <- hex_res[[res_choice]]
   hex_sf <- h3_to_geo_boundary_sf(hexes)
   
-  hex_counts <- samp_coords |>
+  ecoreg <- ecoregions |>
     st_join(hex_sf) |>
-    group_by(h3_index) |>
-    summarise(count = sum(point)) |>
-    ungroup() |>
-    mutate(prop = count / max(count)) |>
-    filter(prop > 0.01)
+    filter(!is.na(h3_index)) |>
+    distinct(ECO_NAME, .keep_all = TRUE)
+  # ecoreg <- ecoreg |>
+  #   st_cast("POLYGON") |>
+  #   select(-h3_index) |>
+  #   mutate(poly_id = 1:n())
+  # ecoreg <- ecoreg |>
+  #   st_join(hex_sf) |>
+  #   filter(!is.na(h3_index)) |>
+  #   distinct(poly_id, .keep_all = TRUE)
   
   hex_points <- pred_sf |>
     mutate(point = 1) |>
@@ -247,14 +260,6 @@ localize <- function(coord_predict, spec, ecoregions, world, use_preds = TRUE, r
   
   hex_polys <- hex_sf |>
     left_join(hex_counts_pred |> as_tibble() |> select(-geometry))
-  
-  ecoreg <- ecoregions |>
-    st_join(hex_counts) |>
-    filter(!is.na(prop)) |>
-    distinct(ECO_NAME, .keep_all = TRUE)
-  # countries <- world |>
-  #   st_join(hex_counts_pred) |>
-  #   filter(!is.na(prop)) 
   
   hex_polys <- hex_polys |>
     st_intersection(ecoreg)

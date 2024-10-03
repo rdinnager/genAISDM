@@ -16,7 +16,7 @@ distill_data <- distill_data |>
   left_join(spec_lats)
 
 batch_size <- 5e5
-n_epoch <- 6e3
+n_epoch <- 3e3
 
 distill_data <- distill_data |>
   sample_frac()
@@ -74,7 +74,7 @@ generate_training_data <- function(z,
     
   })
   
-  list(coords = coords, t = t, spec = spec$to(device = device), target = target)
+  list(coords = coords, t = t, spec = spec[inds ]$to(device = device), target = target)
 }
 
 coord_dim <- 6
